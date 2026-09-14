@@ -1,0 +1,25 @@
+{
+  "name": "api",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.11.1",
+    "bullmq": "^5.7.0",
+    "dotenv": "^16.4.5",
+    "googleapis": "^171.4.0",
+    "hono": "^4.3.4",
+    "ioredis": "^5.3.2",
+    "pg": "^8.11.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "@types/pg": "^8.11.5",
+    "tsx": "^4.7.3",
+    "typescript": "^5.4.5"
+  }
+}

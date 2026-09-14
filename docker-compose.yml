@@ -1,0 +1,159 @@
+version: '3.8'
+
+# All services share .env for secrets
+# media volume is bind-mounted from host (set MEDIA_HOST_PATH in .env or below)
+
+services:
+
+  # ── Infrastructure ─────────────────────────────────────────────────────────
+ 
+  # ── Application ────────────────────────────────────────────────────────────
+  api:
+#    image: 192.168.0.140:5000/yt-stack-api:latest
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    user: root
+    ports:
+      - "3009:3000"
+    env_file:
+      - .env
+    networks: [medianet]
+    
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 10s
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512mb
+
+  worker1:
+#    image: 192.168.0.140:5000/yt-stack-worker1:latest
+    build:
+      context: ./services/worker1
+      dockerfile: Dockerfile
+    user: root
+    env_file:
+      - .env
+    volumes:
+      - /mnt/blue_442gb/unChecked/VIDEOS:/media
+    networks: [medianet]
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 10s
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512mb
+
+  worker2:
+#    image: 192.168.0.140:5000/yt-stack-worker2:latest
+    build:
+      context: ./services/worker2
+      dockerfile: Dockerfile
+    user: root
+    env_file:
+      - .env
+    volumes:
+      - /mnt/blue_442gb/unChecked/VIDEOS:/media:ro   # read-only for view worker
+    networks: [medianet]
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 10s
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512mb
+
+  worker3:
+#    image: 192.168.0.140:5000/yt-stack-worker3:latest
+    user: root
+    build:
+      context: ./services/worker3
+      dockerfile: Dockerfile
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - /mnt/blue_442gb/unChecked/VIDEOS:/media
+    networks: [medianet]
+    ports:
+      - "3099:3099"
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 10s
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512mb
+
+  worker4:
+ #   image: 192.168.0.140:5000/yt-stack-worker4:latest
+    user: root
+    build:
+      context: ./services/worker4
+      dockerfile: Dockerfile
+    env_file: .env
+    volumes:
+      - /mnt/blue_442gb/unChecked/VIDEOS:/media
+    networks: [medianet]
+    ports:
+      - "3098:3100"
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 10s
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512mb
+
+networks:
+  medianet:
+    driver: overlay
+    external: true
+
+volumes:
+  caddy_data:
+    external: true
+  shared_archives:
+    external: true
+  caddy_config:
+    external: true
+  postgres_data:
+  redis_data:
+  media_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${MEDIA_HOST_PATH:-/opt/media}   # set MEDIA_HOST_PATH in .env
