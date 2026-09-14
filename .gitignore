@@ -1,0 +1,117 @@
+
+*.out
+*.env
+*.sh
+
+# Ignore node_modules and package lock files
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Angular build output
+dist/
+.angular/
+out-tsc/
+.cache/
+
+# Build artifacts
+build/
+tmp/
+temp/
+*.log
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.sw?
+
+# Git related
+.git/
+*.orig
+
+# OS-specific files
+
+.DS_Store
+Thumbs.db
+
+# Environment files
+#.env
+#.env.*
+
+# Database files
+*.sqlite
+*.sqlite3
+*.db
+*.db3
+#*.sql
+*.dump
+*.bak
+
+# Media files (ignore large images/videos)
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.svg
+*.ico
+*.webp
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.flv
+*.mp3
+*.wav
+*.ogg
+
+# Ignore large files >45MB
+# Git doesn't support file size ignoring natively via .gitignore,
+# Use this script in pre-commit hook instead:
+#
+# .git/hooks/pre-commit
+# ----------------------
+# #!/bin/bash
+# maxsize=45000000
+# for file in $(git diff --cached --name-only); do
+#   if [[ -f "$file" ]]; then
+#     size=$(wc -c <"$file")
+#     if [ "$size" -gt "$maxsize" ]; then
+#       echo "$file is too large ($size bytes). Commit blocked!"
+#       exit 1
+#     fi
+#   fi
+# done
+# ----------------------
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Compiled TypeScript
+*.tsbuildinfo
+
+# Coverage
+coverage/
+
+# Local Docker stuff
+docker-compose.override.yml
+*.local.yml
+*.env.local
+
+# Misc cache/temp
+*.pid
+*.seed
+*.tgz
+*.gz
+*.zip
+
+# Other auto-generated
+.husky/_/*
+*.iml
+node_modules
+dist
+.cache
+.env
+*.env
