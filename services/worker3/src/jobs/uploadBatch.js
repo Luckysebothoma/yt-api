@@ -160,7 +160,8 @@ async function handleBatch(job) {
             err.message.includes('Quota exceeded')
           ) {
             await log.error('Quota exhausted during upload — stopping batch');
-            break;
+            // shutdown the process so that swarm will restart it and new process will be sent
+            process.exit(1);
           } else {
             await log.error(`Error uploading ${file}: ${err.message}`);
           }
