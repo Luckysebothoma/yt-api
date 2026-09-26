@@ -43,7 +43,7 @@ services:
     env_file:
       - .env
     volumes:
-      - /mnt/blue_488gb/VIDEOS:/media
+      - /mnt/blue_488gb/DUPLICATES/VIDEOS:/media
     networks: [medianet]
     deploy:
       replicas: 1
@@ -68,7 +68,7 @@ services:
     env_file:
       - .env
     volumes:
-      - /mnt/blue_488gb/VIDEOS:/media:ro   # read-only for view worker
+      - /mnt/blue_488gb/DUPLICATES/VIDEOS:/media:ro   # read-only for view worker
     networks: [medianet]
     deploy:
       replicas: 1
@@ -93,7 +93,7 @@ services:
     env_file: .env
     restart: unless-stopped
     volumes:
-      - /mnt/blue_488gb/VIDEOS:/media
+      - /mnt/blue_488gb/DUPLICATES/VIDEOS:/media
     networks: [medianet]
     ports:
       - "3099:3099"
@@ -119,7 +119,7 @@ services:
 #      dockerfile: Dockerfile
     env_file: .env
     volumes:
-      - /mnt/blue_488gb/VIDEOS:/media
+      - /mnt/blue_488gb/DUPLICATES/VIDEOS:/media
     networks: [medianet]
     ports:
       - "3098:3100"

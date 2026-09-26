@@ -21,10 +21,18 @@ viewRouter.get('/yt-videos', async (c) => {
 
 // GET /view/links — get all stored YouTube URLs from DB
 viewRouter.get('/links', async (c) => {
-  const job = await viewQueue.add('get-links', {});
+  const job = await viewQueue.add(
+    'get-links',
+    { limit: c.req.query('limit'), offset: c.req.query('offset') },
+    {
+      removeOnComplete: { age: 600, count: 50 },
+      removeOnFail:     { age: 3600, count: 50 },
+    },
+  );
   await log.info(`Enqueued get-links job ${job.id}`);
   return c.json({ jobId: job.id, status: 'queued' });
 });
+
 
 // GET /view/job/:id — poll job result
 viewRouter.get('/job/:id', async (c) => {
