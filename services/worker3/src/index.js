@@ -2,10 +2,10 @@
 require('dotenv/config');
 const { Worker }          = require('bullmq');
 const express             = require('express');
-const { redisConnection, getRedis } = require('./lib/redis');
+const { redisConnectionWithRetry, getRedis } = require('./lib/redis');
 const { db }              = require('./lib/db');
 const { runMigration }    = require('./lib/migrate');
-const { handleBatch }     = require('./jobs/uploadBatch');
+const { handleBatch }     = require('./jobs/uploadBatch').default;
 const { handleSingle }    = require('./jobs/uploadSingle');
 const { Logger }          = require('./lib/logger');
 const streamRouter        = require('./routes/stream');
@@ -16,6 +16,15 @@ const {
 } = require('./lib/shutdown');
 
 const log  = new Logger('worker3');
+
+// Fail fast if a job handler is missing. Without this the worker boots fine,
+// then consumes queued jobs and fails every one of them ("x is not a function").
+for (const [name, fn] of Object.entries({ handleBatch, handleSingle })) {
+  if (typeof fn !== 'function') {
+    console.error(`[worker3] FATAL: ${name} is not a function — check src/jobs exports. Refusing to start.`);
+    process.exit(1);
+  }
+}
 const PORT = Number(process.env.STREAM_PORT ?? 3099);
 
 // Max time to wait for the in-flight upload before giving up. NOTE: docker
@@ -42,7 +51,7 @@ async function start() {
     if (job.name === 'upload-single') return handleSingle(job);
     throw new Error(`Unknown job type: ${job.name}`);
   }, {
-    connection:  redisConnection,
+    connection:  redisConnectionWithRetry,
     concurrency: 1,
   });
 
