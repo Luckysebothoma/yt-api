@@ -11,14 +11,19 @@ const MIGRATION = `
     added_at     TIMESTAMPTZ DEFAULT NOW(),
     synced_at    TIMESTAMPTZ DEFAULT NOW()
   );
+
+  -- Patch FIRST: add filename if the table existed before this column was
+  -- introduced. Must run before any index that references the column.
+  ALTER TABLE yt_registry
+    ADD COLUMN IF NOT EXISTS filename TEXT;
+
   CREATE INDEX IF NOT EXISTS idx_yt_registry_playlist
     ON yt_registry (playlist_id);
   CREATE INDEX IF NOT EXISTS idx_yt_registry_filename
     ON yt_registry (filename);
-
-  -- Patch: add filename if table existed before this column was introduced
-  ALTER TABLE yt_registry
-    ADD COLUMN IF NOT EXISTS filename TEXT;
+  -- Dedup lookups use LOWER(filename); a plain index can't serve them.
+  CREATE INDEX IF NOT EXISTS idx_yt_registry_playlist_lower_filename
+    ON yt_registry (playlist_id, LOWER(filename));
 
   CREATE TABLE IF NOT EXISTS yt_registry_meta (
     playlist_id    TEXT        PRIMARY KEY,
@@ -58,10 +63,8 @@ const MIGRATION = `
 `;
 
 async function runMigration() {
-  // Every statement in MIGRATION uses IF NOT EXISTS / ADD COLUMN IF NOT EXISTS,
-  // so it's safe (and necessary) to actually run this on every startup rather
-  // than just logging that it happened. Without this, yt_registry /
-  // yt_watch_later only exist if someone created them by hand.
+  // Every statement uses IF NOT EXISTS / ADD COLUMN IF NOT EXISTS, so it is
+  // safe to run on every startup.
   await db.query(MIGRATION);
   console.log('[migrate] yt_registry + yt_watch_later tables ready');
 }
