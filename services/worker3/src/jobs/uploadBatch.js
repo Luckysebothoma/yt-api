@@ -1,42 +1,34 @@
 'use strict';
-import 'dotenv/config';
-
-
-import { existsSync, readdirSync, accessSync, constants, promises } from 'fs';
-import { extname, join, basename } from 'path';
-
+require('dotenv/config');
 
 /**
- * Registry Service
- * ================
- * Single source of truth for "has this video/file already been uploaded?".
+ * Upload batch job + Registry service (single file, CommonJS)
+ * ===========================================================
+ * Exports: handleBatch  (BullMQ job "upload-batch", used by src/index.js)
+ *          + the registry functions (same API as lib/registry.js)
  *
- * Backed by a three-tier lookup for the full video-ID set (cheap → expensive):
- *   1. Redis        — hot cache, short TTL, near-zero cost
- *   2. Postgres     — durable, always available, no YouTube quota cost
- *   3. YouTube API  — authoritative, but burns daily quota, used to refresh PG
+ * NOTE: must stay CommonJS. Do NOT mix `import` and `require`, and do NOT use
+ * `export default` — index.js does `const { handleBatch } = require(...)`,
+ * which returns `undefined` for an ES-module default export.
  *
- * Filename-level duplicate checks always go straight to Postgres (plus the
- * Redis "orphan" queue, see below).
- *
- * Orphaned uploads
- * ----------------
- * If a video reaches YouTube but the Postgres write fails (after retries),
- * the upload is parked in the Redis hash `yt:orphaned_uploads`. Every job and
- * every worker startup calls recoverOrphans() FIRST, which replays them into
- * Postgres. Until replayed, the filename check also consults the orphan queue
- * so the same file is never uploaded twice.
+ * Registry: three-tier lookup for the video-ID set (Redis -> Postgres -> YouTube API).
+ * Filename duplicate checks go to Postgres (plus the Redis orphan queue).
+ * Orphaned uploads (on YouTube, Postgres write failed) are parked in the Redis
+ * hash `yt:orphaned_uploads` and replayed by recoverOrphans() at the start of
+ * every job and every worker startup.
  */
 
-import fs from 'fs';
-import { google } from 'googleapis';
-const { redisConnection, redisConnectionWithRetry, getRedis } = require('../lib/redis');
-const { ytAuth }              = require('../lib/ytAuth');
-const { db }              = require('../lib/db');
-const { getQuotaUsed, incrementQuota, isQuotaExhausted, QUOTA_DAILY_LIMIT, quotaResetsAt }              = require('../lib/quota');
-const { Logger }              = require('../lib/logger');
-const { uploadVideo }              = require('./uploadSingle');
-
+const fs          = require('fs');
+const path        = require('path');
+const { google }  = require('googleapis');
+const { getRedis } = require('../lib/redis');
+const { db }       = require('../lib/db');
+const { ytAuth }   = require('../lib/ytAuth');
+const { Logger }   = require('../lib/logger');
+const { uploadVideo } = require('./uploadSingle');
+const {
+  incrementQuota, getQuotaUsed, isQuotaExhausted, QUOTA_DAILY_LIMIT, quotaResetsAt,
+} = require('../lib/quota');
 
 // ── Config ────────────────────────────────────────────────────────────────
 
@@ -46,184 +38,6 @@ const PLAYLIST_ID_ENV            = process.env.YT_UPLOADS_PLAYLIST_ID ?? null;
 const ORPHAN_KEY                 = 'yt:orphaned_uploads';
 
 const redisKeyFor = (playlistId) => `yt:registry:${playlistId}`;
-
-
-
-const VIDEO_EXT = new Set(['.mp4', '.mkv', '.mov', '.avi', '.flv', '.wmv']);
-
-async function handleBatch(job) {
-  const log = new Logger('worker3:batch', job);
-  const { groupedDir, batchSize = 15, forceRegistrySync = false } = job.data;
-
-  await log.info(`━━ Batch upload start ━━ dir=${groupedDir} batchSize=${batchSize}`);
-
-  if (!process.env.YT_CLIENT_ID || !process.env.YT_REFRESH_TOKEN) {
-    await log.error('Missing YT credentials in environment');
-    throw new Error('Missing YT credentials');
-  }
-
-  if (!existsSync(groupedDir)) {
-    await log.error(`groupedDir not found: ${groupedDir}`);
-    throw new Error(`groupedDir not found: ${groupedDir}`);
-  }
-
-  // Replay uploads that reached YouTube but not Postgres, BEFORE any dedup check.
-  await recoverOrphans(log);
-
-  const entries    = readdirSync(groupedDir, { withFileTypes: true });
-  const videoFiles = entries
-    .filter(e => e.isFile() && VIDEO_EXT.has(extname(e.name).toLowerCase()))
-    .map(e => join(groupedDir, e.name))
-    .slice(0, batchSize);
-
-  await log.info(`Videos to upload: ${videoFiles.length}`);
-  if (!videoFiles.length) {
-    return { results: [], skipped: 0, uploaded: 0 };
-  }
-
-  const readable = videoFiles.filter(f => {
-    try { accessSync(f, constants.R_OK); return true; } catch { return false; }
-  });
-
-  await log.info('Resolving registry (Redis → PG → YouTube API)...');
-  let registry;
-  try {
-    registry = await syncRegistry(job.id, log, { forceSync: forceRegistrySync });
-  } catch (err) {
-    if (err.message === 'QUOTA_EXHAUSTED') {
-      return { results: [], skipped: videoFiles.length, uploaded: 0, abortReason: 'quota_exhausted' };
-    }
-    throw err;
-  }
-
-  const pid      = process.env.YT_UPLOADS_PLAYLIST_ID ?? 'unknown';
-  const results  = [];
-  let uploaded   = 0;
-  let skipped    = 0;
-
-  for (const file of readable) {
-    if (await isQuotaExhausted()) {
-      await log.error(`Quota exhausted mid-batch (${await getQuotaUsed()}/${QUOTA_DAILY_LIMIT}) — stopping`);
-      results.push({ file, status: 'skipped', reason: 'quota_exhausted' });
-      skipped++;
-      continue;
-    }
-
-    try {
-      const filename = basename(file);
-
-      // Check the registry BEFORE uploading. Checking afterwards (the old
-      // behaviour) meant the file had already been streamed to YouTube and
-      // written into yt_registry by the time we found out it was a
-      // duplicate — burning quota and creating a second video on the
-      // channel for something we were about to skip anyway.
-      const filenameExists = await check_if_filename_exists_in_registry(pid, filename);
-
-      if (filenameExists) {
-        await log.warn(`Filename ${filename} already exists in registry — skipping upload (no YouTube call made)`);
-        // move and tag the file as skipped to prevent re-processing in future batches
-        const skippedDir = join(groupedDir, 'skipped');
-        if (!existsSync(skippedDir)) {
-          // DO nothing now
-//          fs.mkdirSync(skippedDir);
-        }
-        const destPath = join(skippedDir, `${basename(file, extname(file))}_skipped${extname(file)}`);
-          // DO not rename now 
-        //      fs.renameSync(file, destPath);
-        console.log(`Moved ${file} → ${destPath}`);
-
-        results.push({ file, status: 'skipped', reason: 'filename_exists' });
-        skipped++;
-        continue;
-      }
-
-      const r = await uploadVideo(file, basename(file, extname(file)), log);
-      const videoId = r.videoId;
-
-      // 1. In-memory registry
-      registry.add(videoId);
-
-      // 2. PG already written by uploadVideo — but ensure filename is stored.
-      //    If uploadVideo parked it as an orphan (PG down) skip this; recoverOrphans() replays it.
-      if (!r.orphaned) {
-        await pgUpsertBatch(pid, [{ videoId, title: r.title ?? filename, filename }]);
-      } else {
-        await log.warn(`${filename} (${videoId}) is on YouTube but parked in the orphan queue — will sync to Postgres later`);
-      }
-
-      // move file to "uploaded" subdir
-      // tag filename_<videoId> with videoId to prevent collisions and for easier tracing
-      // add videoId to filename to prevent collisions and for easier tracing
-      // hide it, so app wont process it again if the batch is re-run
-
-        try{
-
-          const uploadedDir = join(groupedDir, 'uploaded');
-        if (!existsSync(uploadedDir)) {
-          // DO nothing now
-//// Do no
-//           fs.mkdirSync(uploadedDir);
-        }
-        const destPath = join(uploadedDir, `${basename(file, extname(file))}_${videoId}${extname(file)}`);
-     
-        //  fs.renameSync(file, destPath);
-        console.log(`Moved ${file} → ${destPath}`);
-
-        //hide the file so that it is not processed again if the batch is re-run
-        //fs.chmodSync(destPath, 0o000);
-        console.log(`Hid ${destPath}`);
-        }catch(err){
-          await log.error(`Failed to move file ${file} after upload: ${err.message}`);
-          return { results: [], skipped: videoFiles.length, uploaded: 0, abortReason: 'file_move_failed' };
-
-        }
-
-        
-
-
-      // 3. Incremental Redis update — delegated to the registry service so
-      //    there's one place that knows the cache key shape and TTL.
-      if (!r.orphaned) await redisAppend(pid, videoId);
-
-      results.push({ file, ...r, status: 'ok' });
-      uploaded++;
-
-        } catch (err) {
-    console.error(err);
-    console.error(err.stack);
-    results.push({ file, status: 'error', error: err.message });
-      /*if (
-        err.message.includes('exceeded the number of videos') ||
-        err.message.includes('The request cannot be completed because you have exceeded')
-      ) {
-        await log.error('Quota exhausted during upload — stopping batch');
-        break;
-      }
-
-      */
-
-          // We now will check why its catch but we will need to shut it down
-          // for any error app need to shutdown, swarm will restart and new process will be sent
-          if (
-            err.message.includes('exceeded the number of videos') ||
-            err.message.includes('The request cannot be completed because you have exceeded') ||
-            err.message.includes('Quota exceeded')
-          ) {
-            await log.error('Quota exhausted during upload — stopping batch');
-            // shutdown the process so that swarm will restart it and new process will be sent
-            process.exit(1);
-          } else {
-            await log.error(`Error uploading ${file}: ${err.message}`);
-          }
-
-
-    }
-  }
-
-  await log.info(`Batch complete: ${uploaded} uploaded, ${skipped} skipped, ${results.filter(r => r.status === 'error').length} errors`);
-  return { results, uploaded, skipped };
-}
-
 
 // ── Tier 1: Redis ────────────────────────────────────────────────────────
 
@@ -606,7 +420,7 @@ async function syncRegistry(jobId, log, { forceSync = false } = {}) {
 async function check_if_dir_is_accessible(dir) {
   try {
     console.log(`[registry] Checking if directory is accessible: ${dir}`);
-    await promises.access(dir, constants.R_OK);
+    await fs.promises.access(dir, fs.constants.R_OK);
     console.log(`[registry] Directory is accessible: ${dir}`);
     return true;
   } catch {
@@ -615,7 +429,217 @@ async function check_if_dir_is_accessible(dir) {
   }
 }
 
-export default {
+// ── Batch job ─────────────────────────────────────────────────────────────
+
+const VIDEO_EXT = new Set(['.mp4', '.mkv', '.mov', '.avi', '.flv', '.wmv']);
+
+// Where videos live inside the container. Override with UPLOAD_DIR in .env.
+const UPLOAD_BASE_DIR  = process.env.UPLOAD_DIR ?? '/media/grouped';
+const SKIP_DIR_NAMES   = new Set(['skipped', 'uploaded']);   // legacy sub-dirs, never re-scan
+const MAX_SCAN_DEPTH   = 6;
+
+/** All video files under `dir` (recursive, sorted, hidden + legacy dirs skipped). */
+function listVideoFiles(dir, depth = 0) {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+  const out = [];
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue;
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      if (depth < MAX_SCAN_DEPTH && !SKIP_DIR_NAMES.has(e.name)) out.push(...listVideoFiles(full, depth + 1));
+    } else if (e.isFile() && VIDEO_EXT.has(path.extname(e.name).toLowerCase())) {
+      out.push(full);
+    }
+  }
+  return out.sort();
+}
+
+async function handleBatch(job) {
+  const log = new Logger('worker3:batch', job);
+  const { groupedDir, batchSize = 15, forceRegistrySync = false } = job.data;
+
+  await log.info(`━━ Batch upload start ━━ dir=${groupedDir} batchSize=${batchSize}`);
+
+  if (!process.env.YT_CLIENT_ID || !process.env.YT_REFRESH_TOKEN) {
+    await log.error('Missing YT credentials in environment');
+    throw new Error('Missing YT credentials');
+  }
+
+  // Don't depend on the job's folder: old jobs name folders that no longer exist.
+  // Use the job's dir if it is still there, otherwise upload whatever is under the base dir.
+  const pid = process.env.YT_UPLOADS_PLAYLIST_ID ?? 'unknown';
+  let scanDir = UPLOAD_BASE_DIR;
+  if (groupedDir && fs.existsSync(groupedDir)) {
+    scanDir = groupedDir;
+  } else if (groupedDir) {
+    await log.warn(`groupedDir not found: ${groupedDir} — scanning ${UPLOAD_BASE_DIR} instead`);
+  }
+  if (!fs.existsSync(scanDir)) {
+    await log.error(`Upload dir not found: ${scanDir}`);
+    throw new Error(`Upload dir not found: ${scanDir}`);
+  }
+
+  // Replay uploads that reached YouTube but not Postgres, BEFORE any dedup check.
+  await recoverOrphans(log);
+
+  // Drop already-uploaded files BEFORE applying batchSize. Files are not moved after
+  // upload, so taking "the first N" would stall once those N are done.
+  const knownFilenames = await pgLoadFilenames(pid);
+  const allFiles   = listVideoFiles(scanDir);
+  const pending    = allFiles.filter(f => !knownFilenames.has(path.basename(f).toLowerCase()));
+  const videoFiles = pending.slice(0, batchSize);
+  await log.info(`Scanned ${scanDir}: ${allFiles.length} video(s), ${allFiles.length - pending.length} already uploaded, ${pending.length} pending`);
+
+  await log.info(`Videos to upload: ${videoFiles.length}`);
+  if (!videoFiles.length) {
+    return { results: [], skipped: allFiles.length - pending.length, uploaded: 0 };
+  }
+
+  const readable = videoFiles.filter(f => {
+    try { fs.accessSync(f, fs.constants.R_OK); return true; } catch { return false; }
+  });
+
+  await log.info('Resolving registry (Redis → PG → YouTube API)...');
+  let registry;
+  try {
+    registry = await syncRegistry(job.id, log, { forceSync: forceRegistrySync });
+  } catch (err) {
+    if (err.message === 'QUOTA_EXHAUSTED') {
+      return { results: [], skipped: videoFiles.length, uploaded: 0, abortReason: 'quota_exhausted' };
+    }
+    throw err;
+  }
+
+  const results  = [];
+  let uploaded   = 0;
+  let skipped    = 0;
+
+  for (const file of readable) {
+    if (await isQuotaExhausted()) {
+      await log.error(`Quota exhausted mid-batch (${await getQuotaUsed()}/${QUOTA_DAILY_LIMIT}) — stopping`);
+      results.push({ file, status: 'skipped', reason: 'quota_exhausted' });
+      skipped++;
+      continue;
+    }
+
+    try {
+      const filename = path.basename(file);
+
+      // Check the registry BEFORE uploading. Checking afterwards (the old
+      // behaviour) meant the file had already been streamed to YouTube and
+      // written into yt_registry by the time we found out it was a
+      // duplicate — burning quota and creating a second video on the
+      // channel for something we were about to skip anyway.
+      const filenameExists = await check_if_filename_exists_in_registry(pid, filename);
+
+      if (filenameExists) {
+        await log.warn(`Filename ${filename} already exists in registry — skipping upload (no YouTube call made)`);
+        // move and tag the file as skipped to prevent re-processing in future batches
+        const skippedDir = path.join(path.dirname(file), 'skipped');
+        if (!fs.existsSync(skippedDir)) {
+          // DO nothing now
+//          fs.mkdirSync(skippedDir);
+        }
+        const destPath = path.join(skippedDir, `${path.basename(file, path.extname(file))}_skipped${path.extname(file)}`);
+          // DO not rename now 
+        //      fs.renameSync(file, destPath);
+        console.log(`Moved ${file} → ${destPath}`);
+
+        results.push({ file, status: 'skipped', reason: 'filename_exists' });
+        skipped++;
+        continue;
+      }
+
+      const r = await uploadVideo(file, path.basename(file, path.extname(file)), log);
+      const videoId = r.videoId;
+
+      // 1. In-memory registry
+      registry.add(videoId);
+
+      // 2. PG already written by uploadVideo — but ensure filename is stored.
+      //    If uploadVideo parked it as an orphan (PG down) skip this; recoverOrphans() replays it.
+      if (!r.orphaned) {
+        await pgUpsertBatch(pid, [{ videoId, title: r.title ?? filename, filename }]);
+      } else {
+        await log.warn(`${filename} (${videoId}) is on YouTube but parked in the orphan queue — will sync to Postgres later`);
+      }
+
+      // move file to "uploaded" subdir
+      // tag filename_<videoId> with videoId to prevent collisions and for easier tracing
+      // add videoId to filename to prevent collisions and for easier tracing
+      // hide it, so app wont process it again if the batch is re-run
+
+        try{
+
+          const uploadedDir = path.join(path.dirname(file), 'uploaded');
+        if (!fs.existsSync(uploadedDir)) {
+          // DO nothing now
+//// Do no
+//           fs.mkdirSync(uploadedDir);
+        }
+        const destPath = path.join(uploadedDir, `${path.basename(file, path.extname(file))}_${videoId}${path.extname(file)}`);
+     
+        //  fs.renameSync(file, destPath);
+        console.log(`Moved ${file} → ${destPath}`);
+
+        //hide the file so that it is not processed again if the batch is re-run
+        //fs.chmodSync(destPath, 0o000);
+        console.log(`Hid ${destPath}`);
+        }catch(err){
+          await log.error(`Failed to move file ${file} after upload: ${err.message}`);
+          return { results: [], skipped: videoFiles.length, uploaded: 0, abortReason: 'file_move_failed' };
+
+        }
+
+        
+
+
+      // 3. Incremental Redis update — delegated to the registry service so
+      //    there's one place that knows the cache key shape and TTL.
+      if (!r.orphaned) await redisAppend(pid, videoId);
+
+      results.push({ file, ...r, status: 'ok' });
+      uploaded++;
+
+        } catch (err) {
+    console.error(err);
+    console.error(err.stack);
+    results.push({ file, status: 'error', error: err.message });
+      /*if (
+        err.message.includes('exceeded the number of videos') ||
+        err.message.includes('The request cannot be completed because you have exceeded')
+      ) {
+        await log.error('Quota exhausted during upload — stopping batch');
+        break;
+      }
+
+      */
+
+          // We now will check why its catch but we will need to shut it down
+          // for any error app need to shutdown, swarm will restart and new process will be sent
+          if (
+            err.message.includes('exceeded the number of videos') ||
+            err.message.includes('The request cannot be completed because you have exceeded') ||
+            err.message.includes('Quota exceeded')
+          ) {
+            await log.error('Quota exhausted during upload — stopping batch');
+            // shutdown the process so that swarm will restart it and new process will be sent
+            process.exit(1);
+          } else {
+            await log.error(`Error uploading ${file}: ${err.message}`);
+          }
+
+
+    }
+  }
+
+  await log.info(`Batch complete: ${uploaded} uploaded, ${skipped} skipped, ${results.filter(r => r.status === 'error').length} errors`);
+  return { results, uploaded, skipped };
+}
+
+module.exports = {
+  handleBatch,
   syncRegistry,
   pgUpsertBatch,
   pgSetMeta,
@@ -628,5 +652,4 @@ export default {
   check_if_filename_exists_in_registry,
   check_if_dir_is_accessible,
   redisAppend,
-  handleBatch
 };

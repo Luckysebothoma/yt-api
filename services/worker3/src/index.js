@@ -2,10 +2,10 @@
 require('dotenv/config');
 const { Worker }          = require('bullmq');
 const express             = require('express');
-const { redisConnectionWithRetry, getRedis } = require('./lib/redis');
+const { redisConnection, getRedis } = require('./lib/redis');
 const { db }              = require('./lib/db');
 const { runMigration }    = require('./lib/migrate');
-const { handleBatch }     = require('./jobs/uploadBatch').default;
+const { handleBatch }     = require('./jobs/uploadBatch');
 const { handleSingle }    = require('./jobs/uploadSingle');
 const { Logger }          = require('./lib/logger');
 const streamRouter        = require('./routes/stream');
@@ -17,8 +17,7 @@ const {
 
 const log  = new Logger('worker3');
 
-// Fail fast if a job handler is missing. Without this the worker boots fine,
-// then consumes queued jobs and fails every one of them ("x is not a function").
+// Fail fast if a job handler is missing, instead of booting and failing every queued job.
 for (const [name, fn] of Object.entries({ handleBatch, handleSingle })) {
   if (typeof fn !== 'function') {
     console.error(`[worker3] FATAL: ${name} is not a function — check src/jobs exports. Refusing to start.`);
@@ -51,7 +50,7 @@ async function start() {
     if (job.name === 'upload-single') return handleSingle(job);
     throw new Error(`Unknown job type: ${job.name}`);
   }, {
-    connection:  redisConnectionWithRetry,
+    connection:  redisConnection,
     concurrency: 1,
   });
 
