@@ -25,12 +25,12 @@ require('dotenv/config');
 
 const fs          = require('fs');
 const { google }  = require('googleapis');
-const { getRedis } = require('./redis');
-const { db }       = require('./db');
-const { ytAuth }   = require('./ytAuth');
+const { getRedis } = require('../lib/redis');
+const { db }       = require('../lib/db');
+const { ytAuth }   = require('../lib/ytAuth');
 const {
   incrementQuota, getQuotaUsed, isQuotaExhausted, QUOTA_DAILY_LIMIT, quotaResetsAt,
-} = require('./quota');
+} = require('../lib/quota');
 
 // ── Config ────────────────────────────────────────────────────────────────
 
