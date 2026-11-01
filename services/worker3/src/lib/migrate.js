@@ -2,6 +2,7 @@
 const { db } = require('./db');
 
 const MIGRATION = `
+BEGIN;
   -- Core registry
   CREATE TABLE IF NOT EXISTS yt_registry (
     video_id     TEXT        PRIMARY KEY,
@@ -60,6 +61,32 @@ const MIGRATION = `
     ON yt_watch_later (resolved);
   CREATE INDEX IF NOT EXISTS idx_yt_watch_later_video_id
     ON yt_watch_later (video_id);
+
+
+
+CREATE TABLE IF NOT EXISTS public.videos (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    yt_url       TEXT NOT NULL,
+    yt_video_id  TEXT NOT NULL,
+    title        TEXT,
+    grouped_name TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Required for ON CONFLICT (yt_video_id) DO NOTHING
+CREATE UNIQUE INDEX IF NOT EXISTS idx_videos_yt_video_id
+    ON public.videos (yt_video_id);
+
+-- Useful for retrieving videos by group
+CREATE INDEX IF NOT EXISTS idx_videos_grouped_name
+    ON public.videos (grouped_name);
+
+-- Useful for listing recently inserted videos
+CREATE INDEX IF NOT EXISTS idx_videos_created_at
+    ON public.videos (created_at DESC);
+
+COMMIT;
+
 `;
 
 async function runMigration() {

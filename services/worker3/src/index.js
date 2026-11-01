@@ -32,7 +32,7 @@ const PORT = Number(process.env.STREAM_PORT ?? 3099);
 const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 15 * 60 * 1000);
 
 async function start() {
-  await runMigration();
+  //await runMigration();
 
   // Sync any uploads that reached YouTube but never reached Postgres
   // (parked in Redis by a previous run) BEFORE accepting new jobs.
